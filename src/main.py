@@ -52,7 +52,6 @@ def extract_fastapi_error(response: httpx.Response) -> str:
         # Fallback for unexpected JSON structures
         return str(data)
     except Exception:
-        # If response body is not JSON or is empty
         return response.text.strip() or f"HTTP {response.status_code}"
 
 
@@ -146,6 +145,7 @@ class LogModal(discord.ui.Modal, title='Create Punishment Log'):
             "username": self.username.value.strip(),
             "punishment_duration": duration_val,
             "server_name": self.server_name.value.strip(),
+            "issued_by": self.issuing_user,
             "reason_given": self.reason_and_review.value.strip() or None
         }
 
@@ -164,7 +164,10 @@ class LogModal(discord.ui.Modal, title='Create Punishment Log'):
                     embed.add_field(name="Server", value=self.server_name.value, inline=True)
                     embed.add_field(name="Issued By", value=self.issuing_user, inline=True)
                     embed.add_field(name="Reason", value=self.reason_and_review.value or "None", inline=False)
-                    await interaction.followup.send(embed=embed, ephemeral=True)
+
+                    # Send public embed to channel, clear interaction ephemerally
+                    await interaction.channel.send(embed=embed)
+                    await interaction.followup.send("✅ Log published successfully.", ephemeral=True)
                 else:
                     await handle_http_error(interaction, response, "create the punishment log")
         except httpx.RequestError as exc:
@@ -258,7 +261,10 @@ class UpdateLogModal(discord.ui.Modal):
                     embed.add_field(name="Duration", value=duration_val, inline=True)
                     embed.add_field(name="Server", value=self.server_name.value, inline=True)
                     embed.add_field(name="Reason", value=self.reason_given.value or "None", inline=False)
-                    await interaction.followup.send(embed=embed, ephemeral=True)
+
+                    # Send public embed to channel, clear interaction ephemerally
+                    await interaction.channel.send(embed=embed)
+                    await interaction.followup.send(f"✅ Log #{self.log_id} update published.", ephemeral=True)
                 else:
                     await handle_http_error(interaction, response, f"update log #{self.log_id}")
         except httpx.RequestError as exc:
@@ -407,9 +413,10 @@ async def delete_log(interaction: discord.Interaction, log_id: int):
             response = await client.delete(f"/logs/{log_id}")
 
             if response.status_code == 200:
-                await interaction.followup.send(
-                    f"🗑️ Successfully deleted Log **#{log_id}**.", ephemeral=True
-                )
+                # Public notice to channel
+                await interaction.channel.send(f"🗑️ Log **#{log_id}** was deleted by {interaction.user.mention}.")
+                # Ephemeral response to dismiss the interaction
+                await interaction.followup.send(f"Log #{log_id} deleted.", ephemeral=True)
             else:
                 await handle_http_error(interaction, response, f"delete log #{log_id}")
     except httpx.RequestError as exc:
