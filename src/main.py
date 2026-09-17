@@ -13,8 +13,6 @@ FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL")
 API_SECRET_CODE = os.getenv("API_SECRET_CODE")
 
 REQUIRED_ROLE_ID = int(os.getenv("REQUIRED_ROLE_ID", "0"))
-_reviewer_id = os.getenv("REVIEWER_ROLE_ID")
-REVIEWER_ROLE_ID = int(_reviewer_id) if _reviewer_id else REQUIRED_ROLE_ID
 
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
 ALERT_ROLE_ID = int(os.getenv("ALERT_ROLE_ID", "0"))
@@ -77,21 +75,6 @@ async def handle_http_error(interaction: discord.Interaction, response: httpx.Re
 
 
 # --- Permission Checks ---
-
-def has_reviewer_role():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.guild:
-            return False
-        user_role_ids = [role.id for role in interaction.user.roles]
-        if REVIEWER_ROLE_ID in user_role_ids:
-            return True
-        await interaction.response.send_message(
-            f"You lack permission to review logs (Requires role ID: `{REVIEWER_ROLE_ID}`).",
-            ephemeral=True,
-        )
-        return False
-    return app_commands.check(predicate)
-
 
 def has_required_role():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -165,7 +148,7 @@ class LogModal(discord.ui.Modal, title='Create Punishment Log'):
                     embed.add_field(name="Issued By", value=self.issuing_user, inline=True)
                     embed.add_field(name="Reason", value=self.reason_and_review.value or "None", inline=False)
 
-                    # Send public embed to channel, clear interaction ephemerally
+                    # Public announcement
                     await interaction.channel.send(embed=embed)
                     await interaction.followup.send("✅ Log published successfully.", ephemeral=True)
                 else:
@@ -262,7 +245,7 @@ class UpdateLogModal(discord.ui.Modal):
                     embed.add_field(name="Server", value=self.server_name.value, inline=True)
                     embed.add_field(name="Reason", value=self.reason_given.value or "None", inline=False)
 
-                    # Send public embed to channel, clear interaction ephemerally
+                    # Public announcement
                     await interaction.channel.send(embed=embed)
                     await interaction.followup.send(f"✅ Log #{self.log_id} update published.", ephemeral=True)
                 else:
@@ -271,62 +254,81 @@ class UpdateLogModal(discord.ui.Modal):
             await interaction.followup.send(f"🚨 Could not connect to API server: `{exc}`", ephemeral=True)
 
 
-# --- Modal & UI Components for Reviewing Logs ---
+# --- Confirmation View for Deleting Logs ---
 
-class ReviewModal(discord.ui.Modal, title='Review Punishment Log'):
-    log_id_input = discord.ui.TextInput(
-        label='Log ID',
-        placeholder='Enter numeric Log ID (e.g. 5)',
-        required=True
-    )
+class DeleteConfirmView(discord.ui.View):
+    def __init__(self, log_id: int, user_id: int, log_data: dict):
+        super().__init__(timeout=60.0)
+        self.log_id = log_id
+        self.user_id = user_id
+        self.log_data = log_data
 
-    def __init__(self, reviewing_user: str):
-        super().__init__()
-        self.reviewing_user = reviewing_user
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ You cannot interact with someone else's confirmation prompt.",
+                ephemeral=True
+            )
+            return False
+        return True
 
-    async def on_submit(self, interaction: discord.Interaction):
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-
-        try:
-            log_id_int = int(self.log_id_input.value.strip())
-        except ValueError:
-            await interaction.followup.send("⚠️ Log ID must be a valid number.", ephemeral=True)
-            return
-
-        payload = {"reviewer": self.reviewing_user}
         headers = {"Authorization": f"Bearer {API_SECRET_CODE}"}
 
         try:
             async with httpx.AsyncClient(base_url=FASTAPI_BASE_URL, headers=headers, timeout=10.0) as client:
-                response = await client.patch(f"/logs/{log_id_int}/review", json=payload)
+                response = await client.delete(f"/logs/{self.log_id}")
 
                 if response.status_code == 200:
-                    embed = discord.Embed(title="Log Marked as Reviewed", color=discord.Color.blue())
-                    embed.add_field(name="Log ID", value=f"#{log_id_int}", inline=True)
-                    embed.add_field(name="Reviewed By", value=self.reviewing_user, inline=True)
-                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    # Public embed showing what was deleted (excluding 'Issued By')
+                    deleted_embed = discord.Embed(
+                        title=f"🗑️ Log #{self.log_id} Deleted",
+                        description=f"Log **#{self.log_id}** was permanently deleted by {interaction.user.mention}.",
+                        color=discord.Color.red()
+                    )
+                    deleted_embed.add_field(
+                        name="Target Player",
+                        value=f"{self.log_data.get('username', 'N/A')}\n(`{self.log_data.get('SteamID') or self.log_data.get('steam_id', 'N/A')}`)",
+                        inline=True
+                    )
+                    deleted_embed.add_field(
+                        name="Duration",
+                        value=str(self.log_data.get("punishment_duration", "N/A")),
+                        inline=True
+                    )
+                    deleted_embed.add_field(
+                        name="Server",
+                        value=str(self.log_data.get("server_name", "N/A")),
+                        inline=True
+                    )
+                    deleted_embed.add_field(
+                        name="Reason",
+                        value=str(self.log_data.get("reason_given") or "None"),
+                        inline=False
+                    )
+
+                    await interaction.channel.send(embed=deleted_embed)
+
+                    # Disable buttons on the ephemeral prompt
+                    for child in self.children:
+                        child.disabled = True
+                    await interaction.edit_original_response(
+                        content=f"✅ Log **#{self.log_id}** has been deleted.",
+                        embed=None,
+                        view=self
+                    )
                 else:
-                    await handle_http_error(interaction, response, f"review log #{log_id_int}")
+                    await handle_http_error(interaction, response, f"delete log #{self.log_id}")
         except httpx.RequestError as exc:
             await interaction.followup.send(f"🚨 Could not connect to API server: `{exc}`", ephemeral=True)
 
-
-class ReviewerSelect(discord.ui.Select):
-    def __init__(self, eligible_members):
-        options = [
-            discord.SelectOption(label=member.display_name, description=str(member), value=str(member))
-            for member in eligible_members[:25]
-        ]
-        super().__init__(placeholder="Select who reviewed this log...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(ReviewModal(reviewing_user=self.values[0]))
-
-
-class ReviewerSelectView(discord.ui.View):
-    def __init__(self, eligible_members):
-        super().__init__()
-        self.add_item(ReviewerSelect(eligible_members))
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="❌ Log deletion cancelled.", embed=None, view=self)
 
 
 # --- Slash Commands ---
@@ -378,28 +380,6 @@ async def update_log_command(interaction: discord.Interaction, log_id: int):
         await interaction.response.send_message(f"🚨 Could not connect to API server: `{exc}`", ephemeral=True)
 
 
-@bot.tree.command(name="review_log", description="Mark an existing punishment log as reviewed.")
-@has_reviewer_role()
-async def review_log_command(interaction: discord.Interaction):
-    eligible_members = [
-        m for m in interaction.guild.members
-        if REVIEWER_ROLE_ID in [r.id for r in m.roles]
-    ]
-
-    if not eligible_members:
-        await interaction.response.send_message(
-            f"No members found with role ID `{REVIEWER_ROLE_ID}`.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        "Who is reviewing the log?",
-        view=ReviewerSelectView(eligible_members),
-        ephemeral=True
-    )
-
-
 @bot.tree.command(name="delete_log", description="Delete an existing log by ID.")
 @has_required_role()
 @app_commands.describe(log_id="The numeric ID of the log to delete")
@@ -409,16 +389,38 @@ async def delete_log(interaction: discord.Interaction, log_id: int):
     headers = {"Authorization": f"Bearer {API_SECRET_CODE}"}
 
     try:
-        async with httpx.AsyncClient(base_url=FASTAPI_BASE_URL, headers=headers, timeout=10.0) as client:
-            response = await client.delete(f"/logs/{log_id}")
+        # Step 1: Fetch the existing log details
+        async with httpx.AsyncClient(base_url=FASTAPI_BASE_URL, headers=headers, timeout=5.0) as client:
+            response = await client.get(f"/logs/{log_id}")
 
-            if response.status_code == 200:
-                # Public notice to channel
-                await interaction.channel.send(f"🗑️ Log **#{log_id}** was deleted by {interaction.user.mention}.")
-                # Ephemeral response to dismiss the interaction
-                await interaction.followup.send(f"Log #{log_id} deleted.", ephemeral=True)
-            else:
-                await handle_http_error(interaction, response, f"delete log #{log_id}")
+            if response.status_code == 404:
+                await interaction.followup.send(f"🔍 Log `#{log_id}` does not exist.", ephemeral=True)
+                return
+            elif response.status_code != 200:
+                await handle_http_error(interaction, response, f"fetch log #{log_id}")
+                return
+
+            log_data = response.json()
+
+        # Step 2: Build confirmation prompt embed (without 'Issued By')
+        embed = discord.Embed(
+            title=f"⚠️ Are you sure you want to delete Log #{log_id}?",
+            description="This action cannot be undone.",
+            color=discord.Color.dark_red()
+        )
+        embed.add_field(
+            name="Target Player",
+            value=f"{log_data.get('username', 'N/A')}\n(`{log_data.get('SteamID') or log_data.get('steam_id', 'N/A')}`)",
+            inline=True
+        )
+        embed.add_field(name="Duration", value=str(log_data.get("punishment_duration", "N/A")), inline=True)
+        embed.add_field(name="Server", value=str(log_data.get("server_name", "N/A")), inline=True)
+        embed.add_field(name="Reason", value=str(log_data.get("reason_given") or "None"), inline=False)
+
+        # Pass log_data to the view so the confirm callback can use it for the final embed
+        view = DeleteConfirmView(log_id=log_id, user_id=interaction.user.id, log_data=log_data)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
     except httpx.RequestError as exc:
         await interaction.followup.send(f"🚨 Could not connect to API server: `{exc}`", ephemeral=True)
 
